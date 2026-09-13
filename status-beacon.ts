@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-type NeonState =
+type BeaconState =
   | "off"
   | "idle"
   | "working"
@@ -10,14 +10,14 @@ type NeonState =
   | "waiting"
   | "success"
   | "error";
-type ToolInfo = { state: NeonState; order: number };
+type ToolInfo = { state: BeaconState; order: number };
 
-const ENTRY_ID = "ric/neon:status";
+const STATUS_BEACON_ENTRY_ID = "ric/status-beacon:status";
 const HEARTBEAT_MS = 5_000;
 const ERROR_DURATION_MS = 1_200;
 const IPC_TIMEOUT_MS = 400;
 
-const TOOL_STATE_PRIORITY: Record<NeonState, number> = {
+const TOOL_STATE_PRIORITY: Record<BeaconState, number> = {
   off: 0,
   idle: 0,
   working: 1,
@@ -29,7 +29,7 @@ const TOOL_STATE_PRIORITY: Record<NeonState, number> = {
   error: 0,
 };
 
-function semanticState(toolName: string): NeonState {
+function semanticState(toolName: string): BeaconState {
   const normalized = toolName.toLowerCase();
   if (
     [
@@ -67,11 +67,11 @@ export default function (pi: ExtensionAPI) {
   // Keep at most one IPC request in flight and one latest request pending. A
   // missing or slow Noctalia must never build an unbounded queue in Pi.
   let transportPromise: Promise<void> | null = null;
-  let pendingState: NeonState | null = null;
+  let pendingState: BeaconState | null = null;
   let pendingForce = false;
-  let lastSentState: NeonState | null = null;
+  let lastSentState: BeaconState | null = null;
 
-  function computeCurrentState(): NeonState {
+  function computeCurrentState(): BeaconState {
     if (!sessionActive) return "off";
     if (temporaryErrorUntil > Date.now()) return "error";
     if (waitingForInput) return "waiting";
@@ -93,7 +93,7 @@ export default function (pi: ExtensionAPI) {
     return "idle";
   }
 
-  function requestState(state: NeonState, force = false): Promise<void> {
+  function requestState(state: BeaconState, force = false): Promise<void> {
     pendingState = state;
     pendingForce = pendingForce || force;
 
@@ -120,7 +120,7 @@ export default function (pi: ExtensionAPI) {
 
       if (!force && state === lastSentState) continue;
 
-      const command = ["msg", "plugin", ENTRY_ID, "all"];
+      const command = ["msg", "plugin", STATUS_BEACON_ENTRY_ID, "all"];
       const args =
         state === "off" ? [...command, "off"] : [...command, "set", state];
       try {
@@ -129,7 +129,7 @@ export default function (pi: ExtensionAPI) {
         });
         if (result.code === 0) lastSentState = state;
       } catch {
-        // Neon is deliberately best-effort; Pi remains fully functional
+        // Status Beacon is deliberately best-effort; Pi remains fully functional
         // when Noctalia is stopped, unavailable, or still starting.
       }
     }
