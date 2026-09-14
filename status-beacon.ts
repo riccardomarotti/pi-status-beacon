@@ -12,7 +12,14 @@ type BeaconState =
   | "error";
 type ToolInfo = { state: BeaconState; order: number };
 
+function generateSourceId(): string {
+  const randomPart = Math.random().toString(36).slice(2, 10);
+  const timePart = Date.now().toString(36).slice(-6);
+  return `pi:${randomPart}${timePart}`;
+}
+
 const STATUS_BEACON_ENTRY_ID = "ric/status-beacon:status";
+const STATUS_BEACON_SOURCE_ID = generateSourceId();
 const HEARTBEAT_MS = 5_000;
 const ERROR_DURATION_MS = 1_200;
 const IPC_TIMEOUT_MS = 400;
@@ -69,7 +76,11 @@ export default function (pi: ExtensionAPI) {
   let transportPromise: Promise<void> | null = null;
   let pendingState: BeaconState | null = null;
   let pendingForce = false;
+  let pendingHeartbeat = false;
+  let pendingClear = false;
   let lastSentState: BeaconState | null = null;
+  let desiredState: BeaconState | null = null;
+  let sourceRegistered = false;
 
   function computeCurrentState(): BeaconState {
     if (!sessionActive) return "off";
@@ -93,42 +104,116 @@ export default function (pi: ExtensionAPI) {
     return "idle";
   }
 
-  function requestState(state: BeaconState, force = false): Promise<void> {
-    pendingState = state;
-    pendingForce = pendingForce || force;
-
+  function ensureTransport(): Promise<void> {
     if (transportPromise === null) {
       const promise = flushTransport();
       transportPromise = promise;
       const finish = () => {
         if (transportPromise !== promise) return;
         transportPromise = null;
-        if (pendingState !== null) requestState(pendingState, pendingForce);
+        if (pendingClear || pendingState !== null || pendingHeartbeat)
+          ensureTransport();
       };
       void promise.then(finish, finish);
     }
-
     return transportPromise;
   }
 
+  function requestState(state: BeaconState, force = false): Promise<void> {
+    if (pendingClear) return ensureTransport();
+    desiredState = state;
+    pendingState = state;
+    pendingForce = pendingForce || force;
+    return ensureTransport();
+  }
+
+  function requestHeartbeat(): Promise<void> {
+    if (pendingClear) return ensureTransport();
+    pendingHeartbeat = true;
+    return ensureTransport();
+  }
+
+  function requestClear(): Promise<void> {
+    pendingState = null;
+    pendingForce = false;
+    pendingHeartbeat = false;
+    pendingClear = true;
+    return ensureTransport();
+  }
+
   async function flushTransport(): Promise<void> {
-    while (pendingState !== null) {
-      const state = pendingState;
-      const force = pendingForce;
-      pendingState = null;
-      pendingForce = false;
+    const command = ["msg", "plugin", STATUS_BEACON_ENTRY_ID, "all"];
+    while (pendingClear || pendingState !== null || pendingHeartbeat) {
+      if (pendingClear) {
+        pendingClear = false;
+        try {
+          const result = await pi.exec(
+            "noctalia",
+            [...command, "clear", STATUS_BEACON_SOURCE_ID],
+            {
+              timeout: IPC_TIMEOUT_MS,
+            },
+          );
+          if (result.code === 0) {
+            lastSentState = null;
+            desiredState = null;
+            sourceRegistered = false;
+          }
+        } catch {
+          // Status Beacon is deliberately best-effort; Pi remains fully functional
+          // when Noctalia is stopped, unavailable, or still starting.
+        }
+        continue;
+      }
 
-      if (!force && state === lastSentState) continue;
+      if (pendingState !== null) {
+        const state = pendingState;
+        const force = pendingForce;
+        pendingState = null;
+        pendingForce = false;
 
-      const command = ["msg", "plugin", STATUS_BEACON_ENTRY_ID, "all"];
-      const args =
-        state === "off" ? [...command, "off"] : [...command, "set", state];
+        if (!force && state === lastSentState && sourceRegistered) continue;
+
+        try {
+          const result = await pi.exec(
+            "noctalia",
+            [...command, "set", STATUS_BEACON_SOURCE_ID, state],
+            {
+              timeout: IPC_TIMEOUT_MS,
+            },
+          );
+          if (result.code === 0) {
+            lastSentState = state;
+            sourceRegistered = true;
+          } else {
+            sourceRegistered = false;
+          }
+        } catch {
+          sourceRegistered = false;
+          // Status Beacon is deliberately best-effort; Pi remains fully functional
+          // when Noctalia is stopped, unavailable, or still starting.
+        }
+        continue;
+      }
+
+      pendingHeartbeat = false;
+      if (!sourceRegistered && desiredState !== null) {
+        pendingState = desiredState;
+        pendingForce = true;
+        continue;
+      }
+
       try {
-        const result = await pi.exec("noctalia", args, {
-          timeout: IPC_TIMEOUT_MS,
-        });
-        if (result.code === 0) lastSentState = state;
+        const result = await pi.exec(
+          "noctalia",
+          [...command, "heartbeat", STATUS_BEACON_SOURCE_ID],
+          {
+            timeout: IPC_TIMEOUT_MS,
+          },
+        );
+        if (result.code !== 0) sourceRegistered = false;
       } catch {
+        sourceRegistered = false;
         // Status Beacon is deliberately best-effort; Pi remains fully functional
         // when Noctalia is stopped, unavailable, or still starting.
       }
@@ -163,7 +248,9 @@ export default function (pi: ExtensionAPI) {
 
   function startHeartbeat(): void {
     if (heartbeatTimer !== null) clearInterval(heartbeatTimer);
-    heartbeatTimer = setInterval(() => publishCurrentState(true), HEARTBEAT_MS);
+    heartbeatTimer = setInterval(() => {
+      void requestHeartbeat();
+    }, HEARTBEAT_MS);
   }
 
   function stopHeartbeat(): void {
@@ -190,7 +277,7 @@ export default function (pi: ExtensionAPI) {
     activeTools.clear();
     stopHeartbeat();
     clearErrorState();
-    await requestState("off", true);
+    await requestClear();
   });
 
   pi.on("agent_start", () => {
