@@ -18,7 +18,7 @@ function generateSourceId(): string {
   return `pi:${randomPart}${timePart}`;
 }
 
-const STATUS_BEACON_ENTRY_ID = "ric/status-beacon:status";
+const STATUS_BEACON_ENTRY_ID = "riccardomarotti/status-beacon:status";
 const STATUS_BEACON_SOURCE_ID = generateSourceId();
 const HEARTBEAT_MS = 5_000;
 const ERROR_DURATION_MS = 1_200;
