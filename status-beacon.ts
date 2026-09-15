@@ -77,6 +77,7 @@ export default function (pi: ExtensionAPI) {
   let pendingState: BeaconState | null = null;
   let pendingForce = false;
   let pendingHeartbeat = false;
+  let pendingTouch = false;
   let pendingClear = false;
   let lastSentState: BeaconState | null = null;
   let desiredState: BeaconState | null = null;
@@ -111,7 +112,12 @@ export default function (pi: ExtensionAPI) {
       const finish = () => {
         if (transportPromise !== promise) return;
         transportPromise = null;
-        if (pendingClear || pendingState !== null || pendingHeartbeat)
+        if (
+          pendingClear ||
+          pendingState !== null ||
+          pendingHeartbeat ||
+          pendingTouch
+        )
           ensureTransport();
       };
       void promise.then(finish, finish);
@@ -133,17 +139,29 @@ export default function (pi: ExtensionAPI) {
     return ensureTransport();
   }
 
+  function requestTouch(): Promise<void> {
+    if (pendingClear) return ensureTransport();
+    pendingTouch = true;
+    return ensureTransport();
+  }
+
   function requestClear(): Promise<void> {
     pendingState = null;
     pendingForce = false;
     pendingHeartbeat = false;
+    pendingTouch = false;
     pendingClear = true;
     return ensureTransport();
   }
 
   async function flushTransport(): Promise<void> {
     const command = ["msg", "plugin", STATUS_BEACON_ENTRY_ID, "all"];
-    while (pendingClear || pendingState !== null || pendingHeartbeat) {
+    while (
+      pendingClear ||
+      pendingState !== null ||
+      pendingHeartbeat ||
+      pendingTouch
+    ) {
       if (pendingClear) {
         pendingClear = false;
         try {
@@ -188,6 +206,31 @@ export default function (pi: ExtensionAPI) {
           } else {
             sourceRegistered = false;
           }
+        } catch {
+          sourceRegistered = false;
+          // Status Beacon is deliberately best-effort; Pi remains fully functional
+          // when Noctalia is stopped, unavailable, or still starting.
+        }
+        continue;
+      }
+
+      if (pendingTouch) {
+        pendingTouch = false;
+        if (!sourceRegistered && desiredState !== null) {
+          pendingState = desiredState;
+          pendingForce = true;
+          continue;
+        }
+
+        try {
+          const result = await pi.exec(
+            "noctalia",
+            [...command, "touch", STATUS_BEACON_SOURCE_ID],
+            {
+              timeout: IPC_TIMEOUT_MS,
+            },
+          );
+          if (result.code !== 0) sourceRegistered = false;
         } catch {
           sourceRegistered = false;
           // Status Beacon is deliberately best-effort; Pi remains fully functional
@@ -281,9 +324,15 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_start", () => {
+    waitingForInput = false;
     agentRunning = true;
     activeTools.clear();
     publishCurrentState();
+  });
+
+  pi.on("input", (event) => {
+    if (event.source === "interactive" || event.source === "rpc")
+      void requestTouch();
   });
 
   pi.on("agent_settled", () => {
