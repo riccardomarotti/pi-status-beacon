@@ -21,7 +21,7 @@ The GitLab mirror is available at https://gitlab.com/rutilante/pi-status-beacon.
 - Each Pi process gets an independent source ID.
 - Tool names are mapped to semantic states such as `reading`, `writing`, and `running`.
 - Heartbeats keep the source alive while Noctalia is available.
-- Interactive and RPC input acknowledges pending Status Beacon idle alerts.
+- Any writing in Pi (typing or submitting input) cancels pending Status Beacon idle alerts.
 - IPC failures are best-effort and do not interrupt Pi.
 
 ## Requirements

@@ -1,4 +1,7 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  CustomEditor,
+  type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 
 type BeaconState =
   | "off"
@@ -23,6 +26,7 @@ const STATUS_BEACON_SOURCE_ID = generateSourceId();
 const HEARTBEAT_MS = 5_000;
 const ERROR_DURATION_MS = 1_200;
 const IPC_TIMEOUT_MS = 400;
+const ACTIVITY_TOUCH_INTERVAL_MS = 250;
 
 const TOOL_STATE_PRIORITY: Record<BeaconState, number> = {
   off: 0,
@@ -60,6 +64,53 @@ function semanticState(toolName: string): BeaconState {
   return "working";
 }
 
+type EditorLike = {
+  handleInput(data: string): void;
+};
+
+type EditorFactory = (
+  tui: unknown,
+  theme: unknown,
+  keybindings: unknown,
+) => EditorLike;
+
+type EditorRegistry = {
+  getEditorComponent(): EditorFactory | undefined;
+  setEditorComponent(factory: EditorFactory | undefined): void;
+};
+
+type EditorConstructor = new (
+  tui: unknown,
+  theme: unknown,
+  keybindings: unknown,
+  options?: { embedWorkingStatus?: boolean },
+) => EditorLike;
+
+// Pi's type declarations for the editor are not shipped with the installed
+// package, so the documented runtime API is narrowed structurally here.
+const DefaultEditor = CustomEditor as unknown as EditorConstructor;
+
+function createActivityEditorFactory(
+  previous: EditorFactory | undefined,
+  onActivity: () => void,
+): EditorFactory {
+  return (tui, theme, keybindings): EditorLike => {
+    const editor =
+      previous !== undefined
+        ? previous(tui, theme, keybindings)
+        : // Match Pi's built-in editor so replacing it stays invisible.
+          new DefaultEditor(tui, theme, keybindings, {
+            embedWorkingStatus: true,
+          });
+    const handleInput = editor.handleInput.bind(editor);
+    editor.handleInput = (data: string): void => {
+      onActivity();
+      handleInput(data);
+    };
+    return editor;
+  };
+}
+
 export default function (pi: ExtensionAPI) {
   let sessionActive = false;
   let agentRunning = false;
@@ -82,6 +133,10 @@ export default function (pi: ExtensionAPI) {
   let lastSentState: BeaconState | null = null;
   let desiredState: BeaconState | null = null;
   let sourceRegistered = false;
+  let previousEditorFactory: EditorFactory | undefined;
+  let activityEditorFactory: EditorFactory | undefined;
+  let lastActivityTouchAt = 0;
+  let activityTouchTimer: ReturnType<typeof setTimeout> | null = null;
 
   function computeCurrentState(): BeaconState {
     if (!sessionActive) return "off";
@@ -303,7 +358,54 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  pi.on("session_start", () => {
+  // Typing counts as user interaction: it acknowledges completed work and
+  // cancels the pending idle alert even before the message is submitted.
+  function signalUserActivity(): void {
+    const now = Date.now();
+    if (now - lastActivityTouchAt >= ACTIVITY_TOUCH_INTERVAL_MS) {
+      lastActivityTouchAt = now;
+      void requestTouch();
+      return;
+    }
+    if (activityTouchTimer !== null) return;
+    // Trailing edge: never drop the only keystroke of a short burst.
+    activityTouchTimer = setTimeout(
+      () => {
+        activityTouchTimer = null;
+        lastActivityTouchAt = Date.now();
+        void requestTouch();
+      },
+      ACTIVITY_TOUCH_INTERVAL_MS - (now - lastActivityTouchAt),
+    );
+  }
+
+  function stopUserActivitySignal(): void {
+    if (activityTouchTimer !== null) {
+      clearTimeout(activityTouchTimer);
+      activityTouchTimer = null;
+    }
+  }
+
+  function installActivityEditor(ui: EditorRegistry): void {
+    if (activityEditorFactory !== undefined) return;
+    previousEditorFactory = ui.getEditorComponent();
+    activityEditorFactory = createActivityEditorFactory(
+      previousEditorFactory,
+      signalUserActivity,
+    );
+    ui.setEditorComponent(activityEditorFactory);
+  }
+
+  function restoreEditor(ui: EditorRegistry): void {
+    stopUserActivitySignal();
+    if (activityEditorFactory === undefined) return;
+    activityEditorFactory = undefined;
+    ui.setEditorComponent(previousEditorFactory);
+    previousEditorFactory = undefined;
+  }
+
+  pi.on("session_start", (_event, ctx) => {
+    installActivityEditor(ctx.ui as unknown as EditorRegistry);
     sessionActive = true;
     agentRunning = false;
     waitingForInput = false;
@@ -313,7 +415,8 @@ export default function (pi: ExtensionAPI) {
     publishCurrentState(true);
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event, ctx) => {
+    restoreEditor(ctx.ui as unknown as EditorRegistry);
     sessionActive = false;
     agentRunning = false;
     waitingForInput = false;
@@ -332,7 +435,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("input", (event) => {
     if (event.source === "interactive" || event.source === "rpc")
-      void requestTouch();
+      signalUserActivity();
   });
 
   pi.on("agent_settled", () => {
